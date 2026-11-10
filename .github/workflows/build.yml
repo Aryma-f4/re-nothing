@@ -1,0 +1,53 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            artifact: flagr-macos
+          - os: ubuntu-22.04
+            artifact: flagr-linux
+          - os: windows-latest
+            artifact: flagr-windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        if: runner.os != 'Linux'
+        with:
+          python-version: "3.13"
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: .\build.bat
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          python3 -c "import tkinter; print('tk', tkinter.TkVersion)"
+          ./build.sh
+          ditto -c -k --keepParent dist/flagr.app dist/flagr-macos.zip
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-venv python3-tk
+          PYTHON=python3 ./build.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          if-no-files-found: error
+          path: |
+            dist/flagr-macos.zip
+            dist/flagr
+            dist/flagr.exe
