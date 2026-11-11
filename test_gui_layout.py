@@ -33,6 +33,10 @@ class GuiLayoutTest(unittest.TestCase):
             tabs = [w for w in descendants(root) if isinstance(w, ttk.Notebook)
                     and "Submit" in [w.tab(i, "text") for i in w.tabs()]]
             self.assertEqual(len(tabs), 1)
+            panes = [w for w in descendants(root) if isinstance(w, ttk.Panedwindow)]
+            if panes:
+                panes[0].sashpos(0, 1)
+                root.update_idletasks()
             observed["height"] = tabs[0].winfo_height()
             observed["viewable"] = tabs[0].winfo_viewable()
             observed["root_height"] = root.winfo_height()

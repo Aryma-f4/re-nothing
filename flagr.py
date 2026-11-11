@@ -168,7 +168,9 @@ DEFAULT_CFG = {
     "exploits": {},
     "concurrency": 8,
     "exploit_timeout": 20,
-    "exploit_interval": 180,
+    "exploit_interval": 120,
+    "schedule_version": 2,
+    "http_exploits": {},
     "tools": {k: dict(v) for k, v in TOOL_DEFAULTS.items()},
 }
 
@@ -239,6 +241,9 @@ def load_cfg():
     cfg = dict(DEFAULT_CFG)
     if isinstance(stored, dict):
         cfg.update(stored)
+        if stored.get("schedule_version", 1) < 2 and stored.get("exploit_interval") == 180:
+            cfg["exploit_interval"] = 120
+        cfg["schedule_version"] = 2
     cfg["tools"] = merge_tools(stored.get("tools") if isinstance(stored, dict) else None)
     return cfg
 
@@ -759,6 +764,55 @@ def _run_one(team, ip, service, port, cmd, timeout):
                 "flags": [], "rc": -1, "error": str(e)}
 
 
+def _run_http_one(team, ip, service, port, spec, timeout):
+    """Replay a sample HTTP request against a target and extract regex matches."""
+    result = {"team": team, "service": service, "port": port,
+              "flags": [], "rc": -1, "error": None, "tail": ""}
+    try:
+        raw = (spec.get("request") or "").replace("\r\n", "\n")
+        head, _, body = raw.partition("\n\n")
+        lines = head.splitlines()
+        parts = lines[0].split()
+        if len(parts) < 2 or parts[0].upper() not in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"):
+            raise ValueError("request must start with METHOD /path HTTP/1.1")
+        method, path = parts[0].upper(), parts[1]
+        sample_host = ""
+        headers = {}
+        for line in lines[1:]:
+            if ":" not in line:
+                raise ValueError(f"invalid HTTP header: {line[:80]}")
+            key, value = line.split(":", 1)
+            key, value = key.strip(), value.strip()
+            if key.lower() == "host":
+                sample_host = value
+            elif key.lower() not in ("content-length", "connection", "accept-encoding"):
+                headers[key] = value
+        host = f"{ip}:{port}"
+
+        def targetize(value):
+            value = str(value).replace("{ip}", ip).replace("{port}", str(port))
+            return value.replace(sample_host, host) if sample_host else value
+
+        path = targetize(path)
+        body = targetize(body)
+        headers = {key: targetize(value) for key, value in headers.items()}
+        headers["Host"] = host
+        parsed = urllib.parse.urlsplit(path)
+        url = path if parsed.scheme in ("http", "https") else f"http://{host}{path}"
+        response = requests.request(method, url, headers=headers,
+                                    data=body if body else None, timeout=timeout)
+        result["rc"] = response.status_code
+        result["tail"] = response.text[-800:]
+        expression = spec.get("regex") or r"GEMASTIK\{[^}\s]+\}"
+        flags = []
+        for match in re.finditer(expression, response.text):
+            flags.extend(extract_flags(match.group(0)))
+        result["flags"] = list(dict.fromkeys(flags))
+    except (requests.RequestException, ValueError, IndexError, re.error) as e:
+        result["error"] = str(e)
+    return result
+
+
 def run_all(cfg, auth, log=print):
     """Run every (team, service) exploit in parallel, submitting results promptly."""
     own_name = jwt_payload(cfg.get("token") or "").get("sub") or cfg.get("username") or ""
@@ -767,13 +821,19 @@ def run_all(cfg, auth, log=print):
              and t.get("name") != own_name and t.get("ip") != own_ip]
     services = cfg.get("services", [])
     exploits = cfg.get("exploits", {})
+    http_exploits = cfg.get("http_exploits", {})
     tasks = []
     for t in teams:
         for s in services:
-            cmd = (exploits.get(s.get("name", "")) or "").strip()
-            if cmd:
-                tasks.append((t.get("name", "?"), t.get("ip", ""),
-                              s.get("name", "?"), int(s.get("port", 0)), cmd))
+            name = s.get("name", "")
+            target = (t.get("name", "?"), t.get("ip", ""),
+                      name, int(s.get("port", 0)))
+            http_spec = http_exploits.get(name) or {}
+            cmd = (exploits.get(name) or "").strip()
+            if (http_spec.get("request") or "").strip():
+                tasks.append((_run_http_one, (*target, http_spec)))
+            elif cmd:
+                tasks.append((_run_one, (*target, cmd)))
     stats = {"targets": len(tasks), "flags": 0, "submitted": 0, "error": None}
     if not tasks:
         log("exploit: no tasks (fill teams / services / exploits)")
@@ -800,7 +860,7 @@ def run_all(cfg, auth, log=print):
         last_submit = time.monotonic()
 
     with ThreadPoolExecutor(max_workers=conc) as ex:
-        futs = [ex.submit(_run_one, *task, timeout) for task in tasks]
+        futs = [ex.submit(runner, *args, timeout) for runner, args in tasks]
         for fut in as_completed(futs):
             r = fut.result()
             where = f"{r['team']} {r['service']}:{r['port']}"
@@ -1056,7 +1116,8 @@ def run_gui():
     outer = ttk.Frame(root, padding=12)
     outer.pack(fill="both", expand=True)
     outer.columnconfigure(0, weight=1)
-    outer.rowconfigure(1, weight=1)
+    outer.rowconfigure(1, weight=5, minsize=300)
+    outer.rowconfigure(2, weight=1, minsize=120)
 
     header = ttk.Frame(outer)
     header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
@@ -1067,14 +1128,8 @@ def run_gui():
     headline_status = ttk.Label(header, text="Ready", style="Muted.TLabel")
     headline_status.grid(row=0, column=1, rowspan=2, sticky="e")
 
-    paned = ttk.Panedwindow(outer, orient="vertical")
-    paned.grid(row=1, column=0, sticky="nsew")
-
-    nb = ttk.Notebook(paned)
-    try:
-        paned.add(nb, weight=5)
-    except tk.TclError:
-        paned.add(nb)
+    nb = ttk.Notebook(outer)
+    nb.grid(row=1, column=0, sticky="nsew")
 
     # ---------- tab: submit ----------
     tab1 = ttk.Frame(nb, padding=12)
@@ -1233,11 +1288,22 @@ def run_gui():
         flags_text.bind(seq, lambda _e: (submit_now(), "break")[1])
 
     # ---------- tab: mass exploit ----------
-    tab2 = ttk.Frame(nb, padding=12)
-    nb.add(tab2, text="Mass exploit")
+    tab2_view = ttk.Frame(nb)
+    nb.add(tab2_view, text="Mass exploit")
+    tab2_view.columnconfigure(0, weight=1)
+    tab2_view.rowconfigure(0, weight=1)
+    mass_canvas = tk.Canvas(tab2_view, highlightthickness=0, borderwidth=0, background=bg)
+    mass_scroll = ttk.Scrollbar(tab2_view, orient="vertical", command=mass_canvas.yview)
+    mass_canvas.configure(yscrollcommand=mass_scroll.set)
+    mass_canvas.grid(row=0, column=0, sticky="nsew")
+    mass_scroll.grid(row=0, column=1, sticky="ns")
+    tab2 = ttk.Frame(mass_canvas, padding=12)
+    mass_window = mass_canvas.create_window((0, 0), window=tab2, anchor="nw")
+    tab2.bind("<Configure>", lambda _e: mass_canvas.configure(scrollregion=mass_canvas.bbox("all")))
+    mass_canvas.bind("<Configure>", lambda e: mass_canvas.itemconfigure(mass_window, width=e.width))
     tab2.columnconfigure(0, weight=1)
     tab2.columnconfigure(1, weight=1)
-    tab2.rowconfigure(0, weight=1)
+    tab2.rowconfigure(0, weight=1, minsize=240)
     target_card = ttk.LabelFrame(tab2, text="Targets", padding=12)
     target_card.grid(row=0, column=0, sticky="nsew", padx=(0, 5), pady=(0, 10))
     target_card.columnconfigure(0, weight=1)
@@ -1290,7 +1356,8 @@ def run_gui():
     def refresh_mass_counts():
         mass_var.set(f"{len(cfg.get('teams', []))} teams · "
                      f"{len(cfg.get('services', []))} services · "
-                     f"{len(cfg.get('exploits', {}))} exploits configured")
+                     f"{len(cfg.get('exploits', {}))} commands · "
+                     f"{len(cfg.get('http_exploits', {}))} HTTP requests")
 
     refresh_mass_counts()
 
@@ -1310,15 +1377,79 @@ def run_gui():
     act = ttk.Frame(runner_card, style="Card.TFrame")
     act.grid(row=2, column=0, sticky="w", pady=(10, 0))
 
+    http_card = ttk.LabelFrame(tab2, text="HTTP request exploit", padding=12)
+    http_card.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+    http_card.columnconfigure(0, weight=1)
+    ttk.Label(http_card, text="Paste a sample request. Host and {ip}:{port} are filled for each target. "
+              "The HTTP request takes priority over a command for the same service.",
+              style="CardMuted.TLabel", wraplength=800).grid(row=0, column=0, sticky="w")
+    http_top = ttk.Frame(http_card, style="Card.TFrame")
+    http_top.grid(row=1, column=0, sticky="ew", pady=(8, 4))
+    ttk.Label(http_top, text="Service", style="Card.TLabel").pack(side="left")
+    http_names = list(cfg.get("http_exploits", {}))
+    service_names = [s.get("name", "") for s in cfg.get("services", [])]
+    http_service_var = tk.StringVar(value=http_names[0] if http_names else
+                                     (service_names[0] if service_names else ""))
+    http_service_combo = ttk.Combobox(http_top, textvariable=http_service_var, width=22,
+                                      values=service_names)
+    http_service_combo.pack(side="left", padx=(6, 12))
+    ttk.Label(http_top, text="Flag regex", style="Card.TLabel").pack(side="left")
+    http_regex_var = tk.StringVar(value=r"GEMASTIK\{[^}\s]+\}")
+    ttk.Entry(http_top, textvariable=http_regex_var, width=35).pack(
+        side="left", fill="x", expand=True, padx=(6, 0))
+    http_text = scrolledtext.ScrolledText(http_card, height=7, wrap="none", font=mono, width=30)
+    http_text.grid(row=2, column=0, sticky="ew")
+    style_text(http_text)
+    http_actions = ttk.Frame(http_card, style="Card.TFrame")
+    http_actions.grid(row=3, column=0, sticky="w", pady=(7, 0))
+
+    def load_http_spec(_event=None):
+        spec = cfg.get("http_exploits", {}).get(http_service_var.get().strip(), {})
+        http_text.delete("1.0", "end")
+        http_text.insert("1.0", spec.get("request") or "")
+        http_regex_var.set(spec.get("regex") or r"GEMASTIK\{[^}\s]+\}")
+
+    def save_http_spec():
+        name = http_service_var.get().strip()
+        request = http_text.get("1.0", "end").strip()
+        if not name or not request:
+            log("HTTP request: choose a service and paste a request first")
+            return False
+        expression = http_regex_var.get().strip() or r"GEMASTIK\{[^}\s]+\}"
+        try:
+            re.compile(expression)
+        except re.error as e:
+            log(f"HTTP regex invalid: {e}")
+            return False
+        cfg.setdefault("http_exploits", {})[name] = {"request": request, "regex": expression}
+        save_cfg(cfg)
+        refresh_mass_counts()
+        log(f"HTTP request saved for {name}")
+        return True
+
+    def remove_http_spec():
+        name = http_service_var.get().strip()
+        cfg.setdefault("http_exploits", {}).pop(name, None)
+        save_cfg(cfg)
+        load_http_spec()
+        refresh_mass_counts()
+        log(f"HTTP request removed for {name}")
+
+    http_service_combo.bind("<<ComboboxSelected>>", load_http_spec)
+    load_http_spec()
+    ttk.Button(http_actions, text="Save HTTP request", command=save_http_spec).pack(side="left")
+    ttk.Button(http_actions, text="Remove", command=remove_http_spec).pack(side="left", padx=(6, 0))
+
     def save_exploit():
         save_fields()
         cfg["teams"] = parse_teams(teams_text.get("1.0", "end"))
         cfg["own_ip"] = own_ip_var.get().strip()
         cfg["services"] = parse_services(services_text.get("1.0", "end"))
+        http_service_combo.configure(values=[s["name"] for s in cfg["services"]])
         cfg["exploits"] = parse_exploits(exploit_text.get("1.0", "end"))
         for key, var, default in (("concurrency", conc_var, 8),
                                   ("exploit_timeout", cto_var, 20),
-                                  ("exploit_interval", eint_var, 180)):
+                                  ("exploit_interval", eint_var, 120)):
             try:
                 cfg[key] = max(1, int(var.get()))
             except (tk.TclError, ValueError):
@@ -1369,7 +1500,7 @@ def run_gui():
                                                    "Start auto exploit", "Stop auto exploit"))
     ttk.Label(runner_card,
               text="Connect WireGuard first. Use each service port from Challenges; "
-                   "180 s repeats every round and submits flags as they arrive.",
+                   "120 s repeats while flagr is open and submits flags as they arrive.",
               style="CardMuted.TLabel", wraplength=800).grid(
                   row=3, column=0, sticky="w", pady=(8, 0))
 
@@ -1389,9 +1520,9 @@ def run_gui():
         if isinstance(w, tk.Text):
             return
         p = w
-        while p is not None and p is not settings_canvas and p not in tool_canvases:
+        while p is not None and p is not settings_canvas and p is not mass_canvas and p not in tool_canvases:
             p = p.master
-        if p is not settings_canvas and p not in tool_canvases:
+        if p is not settings_canvas and p is not mass_canvas and p not in tool_canvases:
             return
         if getattr(e, "num", None) == 4:
             p.yview_scroll(-1, "units")
@@ -1555,13 +1686,10 @@ def run_gui():
         tool_status[name] = lbl
 
     # ---------- shared log ----------
-    log_frame = ttk.LabelFrame(paned, text="Activity", padding=10)
+    log_frame = ttk.LabelFrame(outer, text="Activity", padding=10)
+    log_frame.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
     log_frame.columnconfigure(0, weight=1)
     log_frame.rowconfigure(1, weight=1)
-    try:
-        paned.add(log_frame, weight=1)
-    except tk.TclError:
-        paned.add(log_frame)
 
     log_head = ttk.Frame(log_frame, style="Card.TFrame")
     log_head.grid(row=0, column=0, sticky="ew")
@@ -1614,7 +1742,7 @@ def run_gui():
 
     # ---------- status bar ----------
     status_bar = ttk.Frame(outer, padding=(12, 9), style="Card.TFrame")
-    status_bar.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+    status_bar.grid(row=3, column=0, sticky="ew", pady=(8, 0))
     status_bar.columnconfigure(2, weight=1)
     state = {
         "token": ttk.Label(status_bar, text="token: none", style="Card.TLabel", foreground=warn),
@@ -1689,10 +1817,6 @@ def run_gui():
     def on_close():
         cfg["geometry"] = root.geometry()
         try:
-            cfg["sash"] = paned.sashpos(0) / max(1, paned.winfo_height())
-        except tk.TclError:
-            pass
-        try:
             save_cfg(cfg)
         except Exception:
             pass
@@ -1700,15 +1824,6 @@ def run_gui():
             w.stop.set()
         tools_mgr.terminate_all()
         root.destroy()
-
-    def place_sash():
-        try:
-            h = paned.winfo_height()
-            frac = float(cfg.get("sash") or 0.82)
-            hi = max(430, h - 100)
-            paned.sashpos(0, max(380, min(int(h * frac), hi)))
-        except (tk.TclError, ValueError):
-            pass
 
     if os.environ.get("FLAGR_GUI_TAB"):
         try:
@@ -1720,7 +1835,6 @@ def run_gui():
 
     root.protocol("WM_DELETE_WINDOW", on_close)
     pump()
-    root.after(60, place_sash)
     root.mainloop()
 
 

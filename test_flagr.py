@@ -25,6 +25,7 @@ def fake_jwt():
 class Mock(BaseHTTPRequestHandler):
     seen_flags = set()
     calls = []
+    last_http_host = ""
 
     def log_message(self, *a):
         pass
@@ -63,6 +64,9 @@ class Mock(BaseHTTPRequestHandler):
         self._send(404, {})
 
     def do_GET(self):
+        if self.path == "/note?name=../../flag":
+            Mock.last_http_host = self.headers.get("Host", "")
+            return self._send(200, {"note": "GEMASTIK{http_capture}"})
         if self.path == "/api/user":
             if self.headers.get("Authorization") != f"Bearer {fake_jwt()}":
                 return self._send(401, {"msg": "unauthorized"})
@@ -155,6 +159,37 @@ class FlagrTest(unittest.TestCase):
         result = flagr.process(self.cfg, auth, lambda m: None)
         self.assertEqual(result["accepted"], 1)
         self.assertEqual(Mock.calls[-1][1]["flag"], ["GEMASTIK{single}"])
+
+    def test_http_request_retargets_sample_host_and_extracts_regex(self):
+        sample = ("GET /note?name=../../flag HTTP/1.1\n"
+                  "Host: 10.13.37.7:21000\nAccept: text/plain\n\n")
+        spec = {"request": sample, "regex": r"GEMASTIK\{[^}]+\}"}
+        result = flagr._run_http_one("Opponent", "127.0.0.1", "web", self.port,
+                                     spec, 5)
+        self.assertEqual(result["flags"], ["GEMASTIK{http_capture}"])
+        self.assertEqual(Mock.last_http_host, f"127.0.0.1:{self.port}")
+
+    def test_http_request_runs_for_team_and_submits_flag(self):
+        self.cfg["teams"] = [{"name": "Opponent", "ip": "127.0.0.1", "self": False}]
+        self.cfg["services"] = [{"name": "web", "port": self.port}]
+        self.cfg["http_exploits"] = {"web": {
+            "request": "GET /note?name=../../flag HTTP/1.1\nHost: 10.13.37.7:21000\n\n",
+            "regex": r"GEMASTIK\{[^}]+\}"}}
+        stats = flagr.run_all(self.cfg, flagr.Auth(self.cfg, lambda m: None), lambda m: None)
+        self.assertEqual(stats["targets"], 1)
+        self.assertEqual(stats["flags"], 1)
+        self.assertEqual(stats["submitted"], 1)
+
+    def test_exploit_interval_defaults_to_two_minutes(self):
+        self.assertEqual(flagr.DEFAULT_CFG["exploit_interval"], 120)
+
+    def test_previous_three_minute_default_migrates_once(self):
+        flagr.CFG_F.write_text(json.dumps({"exploit_interval": 180}))
+        cfg = flagr.load_cfg()
+        self.assertEqual(cfg["exploit_interval"], 120)
+        cfg["exploit_interval"] = 180
+        flagr.save_cfg(cfg)
+        self.assertEqual(flagr.load_cfg()["exploit_interval"], 180)
 
     def test_parsers(self):
         self.assertEqual(flagr.parse_teams("A 10.0.0.2\n! Me 10.0.0.1\n# c\n").__len__(), 2)
