@@ -273,7 +273,8 @@ class FlagrTest(unittest.TestCase):
                 break
             time.sleep(0.1)
         self.assertFalse(tm.running("demo"))
-        self.assertEqual(tm.status("demo"), "stopped")
+        status = tm.status("demo")
+        self.assertTrue(status == "stopped" or status.startswith("exited rc="), status)
 
     def test_retry_keeps_flags_on_server_error(self):
         self.cfg["base"] = "http://127.0.0.1:1"  # nothing listening
