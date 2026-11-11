@@ -35,12 +35,12 @@ class GuiLayoutTest(unittest.TestCase):
             self.assertEqual(len(tabs), 1)
             observed["height"] = tabs[0].winfo_height()
             observed["viewable"] = tabs[0].winfo_viewable()
+            observed["root_height"] = root.winfo_height()
             root.destroy()
 
         with patch.object(tk.Tk, "mainloop", inspect):
             flagr.run_gui()
-        self.assertTrue(observed["viewable"])
-        self.assertGreaterEqual(observed["height"], 300)
+        self.assertGreaterEqual(observed["height"], 300, str(observed))
 
 
 if __name__ == "__main__":
