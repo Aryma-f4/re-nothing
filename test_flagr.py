@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from unittest.mock import patch
 
 os.environ["FLAGR_HOME"] = tempfile.mkdtemp(prefix="flagr-test-")
 import flagr  # noqa: E402  (HOME read at import time)
@@ -168,6 +169,24 @@ class FlagrTest(unittest.TestCase):
         self.assertEqual(cfg["tulip"]["url"], "http://localhost:3000")
         for name in ("ataka", "yampa", "tulip"):
             self.assertGreater(len(flagr.TOOL_GUIDES[name]), 200, name)
+
+    def test_tool_setup_checks(self):
+        tool = {"dir": "", "start": "printf ready", "extra": "printf ready",
+                "stop": "", "url": "http://localhost:3000"}
+        self.assertIn("choose the repository directory",
+                      flagr.tool_config_issues("tulip", tool, "start"))
+        self.assertEqual(flagr.tool_config_issues("ataka", tool, "start"), [])
+        self.assertEqual(flagr.tool_config_issues("ataka", tool, "stop"), [])
+        tool["dir"] = "/does/not/exist/flagr"
+        self.assertTrue(any("directory does not exist" in issue for issue in
+                            flagr.tool_config_issues("tulip", tool, "check")))
+        tool["url"] = "javascript:alert(1)"
+        self.assertTrue(any("Web UI URL" in issue for issue in
+                            flagr.tool_config_issues("ataka", tool, "url")))
+        tool["start"] = "atk exploit ls"
+        with patch("flagr.shutil.which", return_value=None):
+            self.assertIn("atk executable is not on PATH",
+                          flagr.tool_config_issues("ataka", tool, "start"))
 
     def test_tools_catch_and_stop(self):
         got = []

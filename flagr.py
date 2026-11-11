@@ -23,6 +23,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import threading
@@ -30,6 +31,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -182,6 +184,39 @@ def merge_tools(stored):
         if name not in out and isinstance(t, dict):
             out[name] = t
     return out
+
+
+def tool_config_issues(name, tool, action="check"):
+    """Return actionable setup problems without running an external command."""
+    issues = []
+    directory = (tool.get("dir") or "").strip()
+    if action in ("check", "start", "extra"):
+        if name in ("yampa", "tulip") and not directory:
+            issues.append("choose the repository directory")
+        elif directory and not Path(directory).is_dir():
+            issues.append(f"directory does not exist: {directory}")
+    field = {"start": "start", "extra": "extra"}.get(action)
+    if field and not (tool.get(field) or "").strip():
+        issues.append(f"{field} command is empty")
+    if action == "check" and not (tool.get("start") or "").strip():
+        issues.append("start command is empty")
+    command = (tool.get("extra") if action == "extra" else tool.get("start")) or ""
+    executable = command.strip().split(maxsplit=1)[0] if command.strip() else ""
+    if action in ("check", "start", "extra") and executable in ("atk", "docker"):
+        if shutil.which(executable) is None:
+            issues.append(f"{executable} executable is not on PATH")
+    url = (tool.get("url") or "").strip()
+    if action == "url" and not url:
+        issues.append("Web UI URL is empty")
+    if url and action in ("check", "url"):
+        try:
+            parsed = urllib.parse.urlsplit(url)
+            valid_url = parsed.scheme in ("http", "https") and bool(parsed.hostname)
+        except ValueError:
+            valid_url = False
+        if not valid_url:
+            issues.append("Web UI URL must start with http:// or https://")
+    return issues
 
 FLAG_RE = re.compile(r"[A-Za-z0-9_]{2,64}\{[^{}\s]{1,512}\}")
 
@@ -893,20 +928,74 @@ def run_gui():
     tools_mgr = Tools(cfg, log, submit=lambda flags: process(cfg, auth, log, extra=flags))
 
     root = tk.Tk()
-    root.title("flagr - GEMASTIK flag submitter")
-    root.geometry(cfg.get("geometry") or "1020x860")
-    root.minsize(960, 740)
+    root.title("flagr · Attack & Defense console")
+    root.geometry(cfg.get("geometry") or "1100x820")
+    root.minsize(900, 680)
 
     ws = root.tk.call("tk", "windowingsystem")
     mono = ("Menlo", 11) if ws == "aqua" else ("Consolas", 10) if ws == "win32" else ("DejaVu Sans Mono", 10)
+    ui_font = ("Helvetica Neue", 11) if ws == "aqua" else ("Segoe UI", 10) if ws == "win32" else ("DejaVu Sans", 10)
+    bg, surface, text_color = "#f2f5fa", "#ffffff", "#172337"
+    muted, accent, good, warn = "#64748b", "#245cb4", "#16734d", "#a85d08"
+    style = ttk.Style(root)
+    style.theme_use("clam")
+    root.configure(background=bg)
+    style.configure("TFrame", background=bg)
+    style.configure("TLabel", background=bg, foreground=text_color, font=ui_font)
+    style.configure("TButton", font=ui_font, padding=(11, 7), background=surface,
+                    foreground=text_color, bordercolor="#ced8e7", lightcolor=surface,
+                    darkcolor=surface, relief="solid", borderwidth=1)
+    style.map("TButton", background=[("active", "#e9f0fb"), ("pressed", "#dce8f9")])
+    style.configure("Accent.TButton", background=accent, foreground="white", padding=(12, 8),
+                    bordercolor=accent, lightcolor=accent, darkcolor=accent, relief="flat")
+    style.map("Accent.TButton", background=[("active", "#174990"), ("disabled", "#a8b6cb")],
+              foreground=[("disabled", "#e4eaf3")])
+    style.configure("TEntry", padding=6, fieldbackground=surface, bordercolor="#ced8e7",
+                    lightcolor="#ced8e7", darkcolor="#ced8e7")
+    style.configure("TSpinbox", padding=5, fieldbackground=surface, bordercolor="#ced8e7")
+    style.configure("TCheckbutton", background=bg, foreground=text_color, font=ui_font)
+    style.configure("TNotebook", background=bg, borderwidth=0)
+    style.configure("TNotebook.Tab", font=(ui_font[0], ui_font[1], "bold"),
+                    padding=(18, 10), background="#e5ebf4", bordercolor=bg)
+    style.map("TNotebook.Tab", background=[("selected", surface), ("active", "#edf3fb")],
+              foreground=[("selected", accent)])
+    style.configure("TLabelframe", background=surface, bordercolor="#dce4ef", relief="solid", padding=10)
+    style.configure("TLabelframe.Label", background=surface, foreground=text_color,
+                    font=(ui_font[0], ui_font[1], "bold"))
+    style.configure("Card.TFrame", background=surface)
+    style.configure("Card.TLabel", background=surface, foreground=text_color, font=ui_font)
+    style.configure("Card.TCheckbutton", background=surface, foreground=text_color, font=ui_font)
+    style.map("Card.TCheckbutton", background=[("active", surface)])
+    style.configure("Muted.TLabel", background=bg, foreground=muted, font=ui_font)
+    style.configure("CardMuted.TLabel", background=surface, foreground=muted, font=ui_font)
+    style.configure("Title.TLabel", background=bg, foreground=text_color,
+                    font=(ui_font[0], 19, "bold"))
+    style.configure("Section.TLabel", background=surface, foreground=text_color,
+                    font=(ui_font[0], ui_font[1], "bold"))
 
-    outer = ttk.Frame(root, padding=8)
+    def style_text(widget):
+        widget.configure(background=surface, foreground=text_color,
+                         insertbackground=text_color, selectbackground="#c8dcfa",
+                         selectforeground=text_color, relief="flat", padx=8, pady=7,
+                         highlightthickness=1, highlightbackground="#dce4ef",
+                         highlightcolor=accent)
+
+    outer = ttk.Frame(root, padding=12)
     outer.pack(fill="both", expand=True)
     outer.columnconfigure(0, weight=1)
-    outer.rowconfigure(0, weight=1)
+    outer.rowconfigure(1, weight=1)
+
+    header = ttk.Frame(outer)
+    header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+    header.columnconfigure(0, weight=1)
+    ttk.Label(header, text="flagr", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(header, text="Flag submission, mass exploits, and external tools in one workspace",
+              style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 0))
+    headline_status = ttk.Label(header, text="Ready", style="Muted.TLabel")
+    headline_status.grid(row=0, column=1, rowspan=2, sticky="e")
 
     paned = ttk.Panedwindow(outer, orient="vertical")
-    paned.grid(row=0, column=0, sticky="nsew")
+    paned.grid(row=1, column=0, sticky="nsew")
 
     nb = ttk.Notebook(paned)
     try:
@@ -915,11 +1004,39 @@ def run_gui():
         paned.add(nb)
 
     # ---------- tab: submit ----------
-    tab1 = ttk.Frame(nb, padding=8)
+    tab1 = ttk.Frame(nb, padding=12)
     nb.add(tab1, text="Submit")
-    tab1.columnconfigure(1, weight=1)
-    tab1.columnconfigure(3, weight=1)
-    tab1.rowconfigure(6, weight=1)
+    tab1.columnconfigure(0, weight=1)
+    tab1.rowconfigure(0, weight=3, minsize=230)
+    tab1.rowconfigure(1, weight=2, minsize=105)
+
+    settings_frame = ttk.Frame(tab1)
+    settings_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+    settings_frame.columnconfigure(0, weight=1)
+    settings_frame.rowconfigure(0, weight=1)
+    settings_canvas = tk.Canvas(settings_frame, highlightthickness=0,
+                                borderwidth=0, background=bg)
+    settings_scroll = ttk.Scrollbar(settings_frame, orient="vertical",
+                                     command=settings_canvas.yview)
+    settings_canvas.configure(yscrollcommand=settings_scroll.set)
+    settings_canvas.grid(row=0, column=0, sticky="nsew")
+    settings_scroll.grid(row=0, column=1, sticky="ns")
+    settings_body = ttk.Frame(settings_canvas)
+    settings_body.columnconfigure(0, weight=1)
+    settings_win = settings_canvas.create_window((0, 0), window=settings_body, anchor="nw")
+    settings_body.bind("<Configure>", lambda _e: settings_canvas.configure(
+        scrollregion=settings_canvas.bbox("all")))
+    settings_canvas.bind("<Configure>", lambda e: settings_canvas.itemconfigure(
+        settings_win, width=e.width))
+
+    connection = ttk.LabelFrame(settings_body, text="Platform & authentication", padding=12)
+    connection.grid(row=0, column=0, sticky="ew")
+    connection.columnconfigure(1, weight=1)
+    connection.columnconfigure(3, weight=1)
+    flag_card = ttk.LabelFrame(tab1, text="Flag queue", padding=12)
+    flag_card.grid(row=0, column=0, sticky="nsew")
+    flag_card.columnconfigure(0, weight=1)
+    flag_card.rowconfigure(2, weight=1, minsize=100)
 
     base_var = tk.StringVar(value=cfg["base"])
     user_var = tk.StringVar(value=cfg["username"])
@@ -927,13 +1044,17 @@ def run_gui():
     int_var = tk.IntVar(value=int(cfg.get("interval", 60)))
     token_var = tk.StringVar(value=cfg.get("token") or "")
 
-    ttk.Label(tab1, text="Platform URL").grid(row=0, column=0, sticky="w", pady=2)
-    ttk.Entry(tab1, textvariable=base_var).grid(row=0, column=1, columnspan=3, sticky="ew", pady=2)
+    ttk.Label(connection, text="Platform URL", style="Card.TLabel").grid(
+        row=0, column=0, sticky="w", padx=(0, 10), pady=4)
+    ttk.Entry(connection, textvariable=base_var).grid(
+        row=0, column=1, columnspan=3, sticky="ew", pady=4)
 
-    ttk.Label(tab1, text="Username").grid(row=1, column=0, sticky="w", pady=2)
-    ttk.Entry(tab1, textvariable=user_var).grid(row=1, column=1, sticky="ew", pady=2)
-    ttk.Label(tab1, text="Password").grid(row=1, column=2, sticky="e", padx=(8, 4))
-    ttk.Entry(tab1, textvariable=pass_var, show="*").grid(row=1, column=3, sticky="ew", pady=2)
+    ttk.Label(connection, text="Username", style="Card.TLabel").grid(
+        row=1, column=0, sticky="w", padx=(0, 10), pady=4)
+    ttk.Entry(connection, textvariable=user_var).grid(row=1, column=1, sticky="ew", pady=4)
+    ttk.Label(connection, text="Password", style="Card.TLabel").grid(
+        row=1, column=2, sticky="e", padx=(12, 8))
+    ttk.Entry(connection, textvariable=pass_var, show="*").grid(row=1, column=3, sticky="ew", pady=4)
 
     def save_fields():
         cfg["base"] = base_var.get().strip().rstrip("/") or cfg["base"]
@@ -975,36 +1096,31 @@ def run_gui():
         token_var.set(cfg["token"])
         log(f"token saved: {sub} · valid {max(0, int(exp - time.time())) // 60}m")
 
-    token_row = ttk.Frame(tab1)
-    token_row.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(4, 0))
-    ttk.Label(token_row, text="Bearer token").pack(side="left")
+    token_row = ttk.Frame(connection, style="Card.TFrame")
+    token_row.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(5, 0))
+    ttk.Label(token_row, text="Bearer token", style="Card.TLabel").pack(side="left", padx=(0, 8))
     ttk.Entry(token_row, textvariable=token_var, show="*").pack(
         side="left", fill="x", expand=True, padx=(6, 6))
     ttk.Button(token_row, text="Save token", command=save_token).pack(side="left")
     ttk.Button(token_row, text="Copy token", command=copy_token).pack(side="left", padx=(6, 0))
 
-    auth_row = ttk.Frame(tab1)
-    auth_row.grid(row=3, column=0, columnspan=4, sticky="ew", pady=4)
+    auth_row = ttk.Frame(connection, style="Card.TFrame")
+    auth_row.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(10, 0))
     ttk.Button(auth_row, text="Login / refresh token", command=do_login).pack(side="left")
     int_box = ttk.Spinbox(auth_row, from_=10, to=3600, width=8, textvariable=int_var,
                           command=lambda: (save_fields(), None))
     int_box.pack(side="right")
-    ttk.Label(auth_row, text="Submit every (s)").pack(side="right", padx=(0, 6))
+    ttk.Label(auth_row, text="Submit every (s)", style="Card.TLabel").pack(
+        side="right", padx=(0, 6))
     int_box.bind("<FocusOut>", lambda _e: save_fields())
 
-    sub_btn = ttk.Button(tab1, text="Start background submitter")
-    sub_btn.grid(row=4, column=0, columnspan=2, sticky="w", pady=4)
-
     ttk.Label(
-        tab1,
-        text=f"Inbox: {INBOX}/*.txt  (`flagr push FLAG` or drop a file)",
-        foreground="#555", wraplength=520, justify="left",
-    ).grid(row=4, column=2, columnspan=2, sticky="e")
-
-    ttk.Label(tab1, text="Flags (paste, one per line or noisy output)").grid(
-        row=5, column=0, columnspan=4, sticky="w", pady=(8, 2))
-    flags_text = scrolledtext.ScrolledText(tab1, height=8, wrap="word", font=mono, width=30)
-    flags_text.grid(row=6, column=0, columnspan=4, sticky="nsew", pady=2)
+        flag_card, text="Paste flags or noisy exploit output below. Recognized flags are queued before submission.",
+        style="CardMuted.TLabel", wraplength=800, justify="left",
+    ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+    flags_text = scrolledtext.ScrolledText(flag_card, height=7, wrap="word", font=mono, width=30)
+    flags_text.grid(row=2, column=0, sticky="nsew")
+    style_text(flags_text)
 
     def submit_now():
         save_fields()
@@ -1012,11 +1128,17 @@ def run_gui():
         if not flags:
             log("no flags found in the text box")
             return
+        try:
+            make_queued_flags(flags)
+        except OSError as e:
+            log(f"could not queue flags: {e}")
+            return
         flags_text.delete("1.0", "end")
+        log(f"queued {len(flags)} flag(s) for submission")
 
         def work():
             try:
-                process(cfg, auth, log, extra=flags)
+                process(cfg, auth, log)
             except Exception as e:
                 log(f"submit failed: {e}")
         threading.Thread(target=work, daemon=True).start()
@@ -1025,54 +1147,65 @@ def run_gui():
         save_fields()
         threading.Thread(target=lambda: process(cfg, auth, log), daemon=True).start()
 
-    action_row = ttk.Frame(tab1)
-    action_row.grid(row=7, column=0, columnspan=4, sticky="w", pady=(2, 8))
-    ttk.Button(action_row, text="Submit now", command=submit_now).pack(side="left")
+    action_row = ttk.Frame(flag_card, style="Card.TFrame")
+    action_row.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+    ttk.Button(action_row, text="Submit now", style="Accent.TButton", command=submit_now).pack(side="left")
     ttk.Button(action_row, text="Flush inbox", command=flush_inbox).pack(side="left", padx=(6, 0))
-    ttk.Label(action_row, text="Ctrl+Enter submits", foreground="#555").pack(
-        side="left", padx=(12, 0))
+    ttk.Label(action_row, text="Ctrl+Enter submits", style="CardMuted.TLabel").pack(
+        side="right", padx=(12, 0))
+    sub_btn = ttk.Button(action_row, text="Start background submitter")
+    sub_btn.pack(side="left", padx=(6, 0))
 
     for seq in ("<Control-Return>", "<Command-Return>"):
         flags_text.bind(seq, lambda _e: (submit_now(), "break")[1])
 
     # ---------- tab: mass exploit ----------
-    tab2 = ttk.Frame(nb, padding=8)
+    tab2 = ttk.Frame(nb, padding=12)
     nb.add(tab2, text="Mass exploit")
     tab2.columnconfigure(0, weight=1)
     tab2.columnconfigure(1, weight=1)
-    tab2.rowconfigure(1, weight=1)
-    tab2.rowconfigure(3, weight=1)
+    tab2.rowconfigure(0, weight=1)
+    target_card = ttk.LabelFrame(tab2, text="Targets", padding=12)
+    target_card.grid(row=0, column=0, sticky="nsew", padx=(0, 5), pady=(0, 10))
+    target_card.columnconfigure(0, weight=1)
+    target_card.columnconfigure(1, weight=1)
+    target_card.rowconfigure(1, weight=1, minsize=115)
 
-    ttk.Label(tab2, text="Teams  (name ip per line;  prefix ! to mark your own)").grid(
-        row=0, column=0, sticky="w")
-    ttk.Label(tab2, text="Services  (name port per line)").grid(
-        row=0, column=1, sticky="w", padx=(8, 0))
+    ttk.Label(target_card, text="Teams · name IP · ! marks own",
+              style="Card.TLabel", wraplength=240).grid(row=0, column=0, sticky="w")
+    ttk.Label(target_card, text="Services · name port", style="Card.TLabel").grid(
+        row=0, column=1, sticky="w", padx=(10, 0))
 
-    teams_text = scrolledtext.ScrolledText(tab2, height=6, wrap="none", font=mono, width=30)
+    teams_text = scrolledtext.ScrolledText(target_card, height=5, wrap="none", font=mono, width=30)
     teams_text.grid(row=1, column=0, sticky="nsew", pady=2)
+    style_text(teams_text)
     teams_text.insert("1.0", dump_teams(cfg.get("teams", [])))
-    services_text = scrolledtext.ScrolledText(tab2, height=6, wrap="none", font=mono, width=30)
-    services_text.grid(row=1, column=1, sticky="nsew", padx=(8, 0), pady=2)
+    services_text = scrolledtext.ScrolledText(target_card, height=5, wrap="none", font=mono, width=30)
+    services_text.grid(row=1, column=1, sticky="nsew", padx=(10, 0), pady=2)
+    style_text(services_text)
     services_text.insert("1.0", dump_services(cfg.get("services", [])))
 
-    ttk.Label(tab2, text="Exploits  (service = your command; "
-                         "{ip} {port} {team} {url} + TARGET_* env are set)").grid(
-        row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
-    exploit_text = scrolledtext.ScrolledText(tab2, height=6, wrap="none", font=mono, width=30)
-    exploit_text.grid(row=3, column=0, columnspan=2, sticky="nsew", pady=2)
+    exploit_card = ttk.LabelFrame(tab2, text="Exploit commands", padding=12)
+    exploit_card.grid(row=0, column=1, sticky="nsew", padx=(5, 0), pady=(0, 10))
+    exploit_card.columnconfigure(0, weight=1)
+    exploit_card.rowconfigure(1, weight=1, minsize=115)
+    ttk.Label(exploit_card, text="One per line: service = command · {ip} {port} {team} {url} supported",
+              style="Card.TLabel", wraplength=375).grid(row=0, column=0, sticky="w")
+    exploit_text = scrolledtext.ScrolledText(exploit_card, height=5, wrap="none", font=mono, width=30)
+    exploit_text.grid(row=1, column=0, sticky="nsew", pady=2)
+    style_text(exploit_text)
     exploit_text.insert("1.0", dump_exploits(cfg.get("exploits", {})))
 
     ttk.Label(
-        tab2,
-        text="e.g.  web = python3 exploits/web.py {url}   |   "
-             "pwn = python3 exploits/pwn.py {ip} {port}   |   "
-             "cry / rev = your script; print flags to stdout",
-        foreground="#555", wraplength=820, justify="left",
-    ).grid(row=4, column=0, columnspan=2, sticky="w")
+        exploit_card, text="Example: web = python3 exploits/web.py {url} · Print flags to stdout",
+        style="CardMuted.TLabel", wraplength=375, justify="left",
+    ).grid(row=2, column=0, sticky="w", pady=(5, 0))
 
     mass_var = tk.StringVar()
-    ttk.Label(tab2, textvariable=mass_var).grid(
-        row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+    runner_card = ttk.LabelFrame(tab2, text="Runner", padding=12)
+    runner_card.grid(row=1, column=0, columnspan=2, sticky="ew")
+    ttk.Label(runner_card, textvariable=mass_var, style="CardMuted.TLabel").grid(
+        row=0, column=0, sticky="w")
 
     def refresh_mass_counts():
         mass_var.set(f"{len(cfg.get('teams', []))} teams · "
@@ -1081,21 +1214,21 @@ def run_gui():
 
     refresh_mass_counts()
 
-    ctl = ttk.Frame(tab2)
-    ctl.grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
+    ctl = ttk.Frame(runner_card, style="Card.TFrame")
+    ctl.grid(row=1, column=0, sticky="w", pady=(9, 0))
     conc_var = tk.IntVar(value=int(cfg.get("concurrency", 8)))
     cto_var = tk.IntVar(value=int(cfg.get("exploit_timeout", 20)))
     eint_var = tk.IntVar(value=int(cfg.get("exploit_interval", 180)))
 
-    ttk.Label(ctl, text="Concurrency").pack(side="left")
+    ttk.Label(ctl, text="Concurrency", style="Card.TLabel").pack(side="left")
     ttk.Spinbox(ctl, from_=1, to=64, width=5, textvariable=conc_var).pack(side="left", padx=(2, 14))
-    ttk.Label(ctl, text="Timeout (s)").pack(side="left")
+    ttk.Label(ctl, text="Timeout (s)", style="Card.TLabel").pack(side="left")
     ttk.Spinbox(ctl, from_=1, to=600, width=5, textvariable=cto_var).pack(side="left", padx=(2, 14))
-    ttk.Label(ctl, text="Auto every (s)").pack(side="left")
+    ttk.Label(ctl, text="Auto every (s)", style="Card.TLabel").pack(side="left")
     ttk.Spinbox(ctl, from_=10, to=3600, width=6, textvariable=eint_var).pack(side="left", padx=(2, 0))
 
-    act = ttk.Frame(tab2)
-    act.grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 0))
+    act = ttk.Frame(runner_card, style="Card.TFrame")
+    act.grid(row=2, column=0, sticky="w", pady=(10, 0))
 
     def save_exploit():
         cfg["teams"] = parse_teams(teams_text.get("1.0", "end"))
@@ -1119,44 +1252,38 @@ def run_gui():
         threading.Thread(target=lambda: run_all(cfg, auth, log), daemon=True).start()
 
     ttk.Button(act, text="Save", command=save_exploit).pack(side="left", padx=(0, 6))
-    ttk.Button(act, text="Run all now", command=run_now).pack(side="left", padx=(0, 6))
+    ttk.Button(act, text="Run all now", style="Accent.TButton", command=run_now).pack(side="left", padx=(0, 6))
     exploit_btn = ttk.Button(act, text="Start auto exploit")
     exploit_btn.pack(side="left")
     exploit_btn.config(command=lambda: toggle_loop("exploit", exploit_btn,
                                                    "Start auto exploit", "Stop auto exploit"))
 
     # ---------- tab: tools (ataka / yampa / tulip) ----------
-    tab3 = ttk.Frame(nb, padding=0)
+    tab3 = ttk.Frame(nb, padding=12)
     nb.add(tab3, text="Tools")
     tab3.columnconfigure(0, weight=1)
-    tab3.rowconfigure(0, weight=1)
-
-    canvas = tk.Canvas(tab3, highlightthickness=0, borderwidth=0,
-                       background=ttk.Style().lookup("TFrame", "background"))
-    vsb = ttk.Scrollbar(tab3, orient="vertical", command=canvas.yview)
-    canvas.configure(yscrollcommand=vsb.set)
-    canvas.grid(row=0, column=0, sticky="nsew")
-    vsb.grid(row=0, column=1, sticky="ns")
-
-    inner = ttk.Frame(canvas, padding=8)
-    inner.columnconfigure(0, weight=1)
-    win = canvas.create_window((0, 0), window=inner, anchor="nw")
-    inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
-    canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
+    tab3.rowconfigure(1, weight=1)
+    ttk.Label(tab3, text="External tools", style="Title.TLabel").grid(
+        row=0, column=0, sticky="w", pady=(0, 8))
+    tool_nb = ttk.Notebook(tab3)
+    tool_nb.grid(row=1, column=0, sticky="nsew")
+    tool_canvases = []
 
     def on_wheel(e):
-        w = canvas.winfo_containing(e.x_root, e.y_root)
+        w = root.winfo_containing(e.x_root, e.y_root)
+        if isinstance(w, tk.Text):
+            return
         p = w
-        while p is not None and p is not canvas:
+        while p is not None and p is not settings_canvas and p not in tool_canvases:
             p = p.master
-        if p is not canvas:
+        if p is not settings_canvas and p not in tool_canvases:
             return
         if getattr(e, "num", None) == 4:
-            canvas.yview_scroll(-1, "units")
+            p.yview_scroll(-1, "units")
         elif getattr(e, "num", None) == 5:
-            canvas.yview_scroll(1, "units")
+            p.yview_scroll(1, "units")
         else:
-            canvas.yview_scroll(-1 if getattr(e, "delta", 0) > 0 else 1, "units")
+            p.yview_scroll(-1 if getattr(e, "delta", 0) > 0 else 1, "units")
 
     root.bind_all("<MouseWheel>", on_wheel)
     root.bind_all("<Button-4>", on_wheel)
@@ -1164,16 +1291,9 @@ def run_gui():
     for idx, key in enumerate(("1", "2", "3")):
         root.bind(f"<Control-Key-{key}>", lambda _e, i=idx: nb.select(i))
 
-    ttk.Label(
-        inner,
-        text="Start/stop external stacks. Ataka: `atk` player-cli on PATH. "
-             "Yampa/Tulip: docker compose + repo dir. "
-             "`catch flags` auto-submits flags printed by the tool.",
-        foreground="#555", wraplength=840, justify="left",
-    ).grid(row=0, column=0, sticky="w", pady=(0, 4))
-
     tool_status = {}
     tool_vars = {}
+    tool_feedback = {}
 
     def tool_save(name):
         tv, cv = tool_vars[name]
@@ -1189,21 +1309,46 @@ def run_gui():
         win.title(f"{name.capitalize()} - guide")
         win.geometry("760x560")
         win.transient(root)
-        frame = ttk.Frame(win, padding=10)
+        frame = ttk.Frame(win, padding=12)
         frame.pack(fill="both", expand=True)
         bar = ttk.Frame(frame)
         bar.pack(side="bottom", fill="x", pady=(8, 0))
         ttk.Button(bar, text="Close", command=win.destroy).pack(side="right")
         txt = scrolledtext.ScrolledText(frame, wrap="word", font=mono)
         txt.pack(fill="both", expand=True)
+        style_text(txt)
         txt.insert("1.0", TOOL_GUIDES.get(name, "No guide for this tool."))
         txt.configure(state="disabled")
         txt.focus_set()
 
     for i, name in enumerate(cfg.get("tools", {}).keys()):
         t = cfg["tools"][name]
-        lf = ttk.LabelFrame(inner, text=name.capitalize(), padding=4)
-        lf.grid(row=i + 1, column=0, sticky="ew", pady=2)
+        page = ttk.Frame(tool_nb)
+        tool_nb.add(page, text=name.capitalize())
+        page.columnconfigure(0, weight=1)
+        page.rowconfigure(0, weight=1)
+        tool_canvas = tk.Canvas(page, highlightthickness=0, borderwidth=0, background=bg)
+        tool_scroll = ttk.Scrollbar(page, orient="vertical", command=tool_canvas.yview)
+        tool_canvas.configure(yscrollcommand=tool_scroll.set)
+        tool_canvas.grid(row=0, column=0, sticky="nsew")
+        tool_scroll.grid(row=0, column=1, sticky="ns")
+        tool_canvases.append(tool_canvas)
+        tool_inner = ttk.Frame(tool_canvas, padding=12)
+        tool_inner.columnconfigure(0, weight=1)
+        tool_win = tool_canvas.create_window((0, 0), window=tool_inner, anchor="nw")
+        tool_inner.bind("<Configure>", lambda _e, c=tool_canvas: c.configure(
+            scrollregion=c.bbox("all")))
+        tool_canvas.bind("<Configure>", lambda e, c=tool_canvas, w=tool_win: c.itemconfigure(
+            w, width=e.width))
+        summary = {
+            "ataka": "Run exploits through the Ataka player CLI.",
+            "yampa": "Manage the Yampa traffic proxy with Docker Compose.",
+            "tulip": "Run the Tulip traffic analysis dashboard.",
+        }.get(name, "Configure and run this external tool.")
+        ttk.Label(tool_inner, text=summary, style="Muted.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, 10))
+        lf = ttk.LabelFrame(tool_inner, text=f"{name.capitalize()} configuration", padding=12)
+        lf.grid(row=1, column=0, sticky="ew")
         lf.columnconfigure(1, weight=1)
 
         tv = {k: tk.StringVar(value=t.get(k, "")) for k in ("dir", "start", "stop", "extra", "url")}
@@ -1211,19 +1356,15 @@ def run_gui():
         tool_vars[name] = (tv, cv)
 
         def add_row(r, label, key, tv=tv, lf=lf):
-            ttk.Label(lf, text=label).grid(row=r, column=0, sticky="w", padx=(0, 4))
-            ttk.Entry(lf, textvariable=tv[key]).grid(row=r, column=1, sticky="ew")
+            ttk.Label(lf, text=label, style="Card.TLabel").grid(
+                row=r, column=0, sticky="w", padx=(0, 10), pady=3)
+            ttk.Entry(lf, textvariable=tv[key]).grid(row=r, column=1, sticky="ew", pady=3)
 
-        add_row(0, "dir", "dir")
-        add_row(1, "start", "start")
-        add_row(2, "stop", "stop")
-        add_row(3, "extra", "extra")
-
-        btns = ttk.Frame(lf)
-        btns.grid(row=0, column=2, rowspan=2, sticky="ne", padx=(6, 0))
-
-        def mk(parent, text, fn):
-            ttk.Button(parent, text=text, command=fn).pack(side="left", padx=1)
+        add_row(0, "Working directory", "dir")
+        add_row(1, "Start command", "start")
+        add_row(2, "Stop command", "stop")
+        add_row(3, "Extra command", "extra")
+        add_row(4, "Web UI URL", "url")
 
         def choose_dir(n=name, tv=tv):
             cur = tv["dir"].get().strip() or os.path.expanduser("~")
@@ -1232,33 +1373,74 @@ def run_gui():
                 tv["dir"].set(path)
                 tool_save(n)
 
-        mk(btns, "Browse", choose_dir)
-        mk(btns, "Guide", lambda n=name: open_guide(n))
-        mk(btns, "Start", lambda n=name: (tool_save(n), tools_mgr.start(n)))
-        mk(btns, "Stop", lambda n=name: (tool_save(n), tools_mgr.stop(n)))
-        mk(btns, "Run extra", lambda n=name: (tool_save(n), tools_mgr.run_once(n)))
+        ttk.Button(lf, text="Browse…", command=choose_dir).grid(
+            row=0, column=2, sticky="w", padx=(8, 0))
+
+        feedback = ttk.Label(lf, text="Edit settings, then Save or Check setup",
+                             style="CardMuted.TLabel")
+        feedback.grid(row=5, column=0, columnspan=2, sticky="w", pady=(9, 0))
+        tool_feedback[name] = feedback
+
+        def report_issues(n, action):
+            issues = tool_config_issues(n, tool_save(n), action)
+            label = tool_feedback[n]
+            if issues:
+                message = "; ".join(issues)
+                label.config(text=message, foreground=warn)
+                log(f"[{n}] setup: {message}")
+                return False
+            label.config(text="Setup looks ready", foreground=good)
+            return True
+
+        def run_tool_action(n, action):
+            if not report_issues(n, action):
+                return
+            if action == "start":
+                tools_mgr.start(n)
+            elif action == "stop":
+                tools_mgr.stop(n)
+            elif action == "extra":
+                tools_mgr.run_once(n)
+
+        btns = ttk.Frame(lf, style="Card.TFrame")
+        btns.grid(row=1, column=2, rowspan=4, sticky="nsew", padx=(12, 0))
+        for col in range(2):
+            btns.columnconfigure(col, weight=1)
+
+        def mk(parent, label, fn, row, col, primary=False):
+            ttk.Button(parent, text=label, command=fn,
+                       style="Accent.TButton" if primary else "TButton").grid(
+                           row=row, column=col, sticky="ew", padx=(0, 6), pady=(0, 6))
+
+        mk(btns, "Start", lambda n=name: run_tool_action(n, "start"), 0, 0, primary=True)
+        mk(btns, "Stop", lambda n=name: run_tool_action(n, "stop"), 0, 1)
+        mk(btns, "Run extra", lambda n=name: run_tool_action(n, "extra"), 1, 0)
+        mk(btns, "Save", lambda n=name: (tool_save(n),
+                                         tool_feedback[n].config(text="Settings saved", foreground=good)), 2, 0)
+        mk(btns, "Check setup", lambda n=name: report_issues(n, "check"), 2, 1)
+        mk(btns, "Guide", lambda n=name: open_guide(n), 3, 0)
 
         def open_url(n=name):
-            url = (tool_save(n).get("url") or "").strip()
-            if not url:
-                log(f"[{n}] no url configured")
+            if not report_issues(n, "url"):
                 return
+            url = cfg["tools"][n]["url"]
             import webbrowser
             log(f"[{n}] opening {url}")
             webbrowser.open(url)
 
-        mk(btns, "Open UI", open_url)
+        mk(btns, "Open UI", open_url, 1, 1)
 
-        foot = ttk.Frame(lf)
-        foot.grid(row=3, column=2, sticky="e", padx=(6, 0))
+        foot = ttk.Frame(lf, style="Card.TFrame")
+        foot.grid(row=5, column=2, sticky="e", padx=(12, 0))
         ttk.Checkbutton(foot, text="catch flags", variable=cv,
-                        command=lambda n=name: tool_save(n)).pack(side="left")
-        lbl = ttk.Label(foot, text="stopped", foreground="#666")
-        lbl.pack(side="left", padx=(8, 0))
+                        style="Card.TCheckbutton",
+                        command=lambda n=name: tool_save(n)).pack(side="top", anchor="e")
+        lbl = ttk.Label(foot, text="● Stopped", style="CardMuted.TLabel")
+        lbl.pack(side="top", anchor="e", pady=(6, 0))
         tool_status[name] = lbl
 
     # ---------- shared log ----------
-    log_frame = ttk.Frame(paned)
+    log_frame = ttk.LabelFrame(paned, text="Activity", padding=10)
     log_frame.columnconfigure(0, weight=1)
     log_frame.rowconfigure(1, weight=1)
     try:
@@ -1266,10 +1448,11 @@ def run_gui():
     except tk.TclError:
         paned.add(log_frame)
 
-    log_head = ttk.Frame(log_frame)
+    log_head = ttk.Frame(log_frame, style="Card.TFrame")
     log_head.grid(row=0, column=0, sticky="ew")
     log_head.columnconfigure(1, weight=1)
-    ttk.Label(log_head, text="Log").grid(row=0, column=0, sticky="w")
+    ttk.Label(log_head, text="Latest submission and tool output", style="CardMuted.TLabel").grid(
+        row=0, column=0, sticky="w")
     autoscroll = tk.BooleanVar(value=True)
 
     def clear_log():
@@ -1281,9 +1464,13 @@ def run_gui():
     ttk.Checkbutton(log_head, text="auto-scroll", variable=autoscroll).grid(
         row=0, column=2, sticky="e", padx=(8, 0))
 
-    logbox = scrolledtext.ScrolledText(log_frame, height=10, state="disabled",
+    logbox = scrolledtext.ScrolledText(log_frame, height=5, state="disabled",
                                        wrap="word", font=mono, width=30)
     logbox.grid(row=1, column=0, sticky="nsew")
+    style_text(logbox)
+    logbox.tag_configure("time", foreground=muted)
+    logbox.tag_configure("success", foreground=good)
+    logbox.tag_configure("warning", foreground=warn)
 
     # ---------- background loops ----------
     loops = {}
@@ -1311,14 +1498,15 @@ def run_gui():
                                                "Stop background submitter"))
 
     # ---------- status bar ----------
-    status_bar = ttk.Frame(outer, padding=(2, 5))
-    status_bar.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+    status_bar = ttk.Frame(outer, padding=(12, 9), style="Card.TFrame")
+    status_bar.grid(row=2, column=0, sticky="ew", pady=(8, 0))
     status_bar.columnconfigure(2, weight=1)
     state = {
-        "token": ttk.Label(status_bar, text="token: none", foreground="#a60"),
-        "inbox": ttk.Label(status_bar, text="inbox: 0"),
+        "token": ttk.Label(status_bar, text="token: none", style="Card.TLabel", foreground=warn),
+        "inbox": ttk.Label(status_bar, text="inbox: 0", style="Card.TLabel"),
         "loops": ttk.Label(status_bar,
-                           text="submitter: off · exploit loop: off · tools up: 0"),
+                           text="submitter: off · exploit loop: off · tools up: 0",
+                           style="Card.TLabel"),
     }
     state["token"].grid(row=0, column=0, sticky="w")
     ttk.Separator(status_bar, orient="vertical").grid(row=0, column=1, sticky="ns", padx=8)
@@ -1327,7 +1515,14 @@ def run_gui():
 
     def append_log(msg):
         logbox.configure(state="normal")
-        logbox.insert("end", f"{time.strftime('%H:%M:%S')} {msg}\n")
+        logbox.insert("end", time.strftime("%H:%M:%S") + "  ", "time")
+        lower = msg.lower()
+        tag = "warning" if any(word in lower for word in ("failed", "error", "invalid", "rejected")) else (
+            "success" if any(word in lower for word in ("accepted", "saved", "login ok")) else None)
+        if tag:
+            logbox.insert("end", msg + "\n", tag)
+        else:
+            logbox.insert("end", msg + "\n")
         try:
             if int(logbox.index("end-1c").split(".")[0]) > 3000:
                 logbox.delete("1.0", "1200.0")
@@ -1342,8 +1537,8 @@ def run_gui():
     def refresh_status():
         for name, lbl in tool_status.items():
             s = tools_mgr.status(name)
-            color = "#0a0" if s.startswith("running") else "#a60" if s.startswith("exited") else "#666"
-            lbl.config(text=s, foreground=color)
+            color = good if s.startswith("running") else warn if s.startswith("exited") else muted
+            lbl.config(text=f"● {s.capitalize()}", foreground=color)
 
         now = time.time()
         if now - scan["at"] > 1.0:
@@ -1356,12 +1551,15 @@ def run_gui():
         has_token = bool(cfg.get("token"))
         token_txt = f"token: {left // 60}m{left % 60:02d}s" if has_token and left else "token: none"
         state["token"].config(text=token_txt,
-                              foreground="#0a0" if token_txt != "token: none" else "#a60")
+                              foreground=good if token_txt != "token: none" else warn)
         state["inbox"].config(text=f"inbox: {scan['n']}")
         running_tools = sum(1 for n in tool_status if tools_mgr.running(n))
+        active_loops = sum(w.is_alive() and not w.stop.is_set() for w in loops.values())
+        headline_status.config(text=f"{active_loops} automation(s) active  ·  {running_tools} tool(s) running",
+                               foreground=good if active_loops or running_tools else muted)
         state["loops"].config(
-            text=f"submitter: {'on' if 'submit' in loops else 'off'} · "
-                 f"exploit loop: {'on' if 'exploit' in loops else 'off'} · "
+            text=f"submitter: {'on' if 'submit' in loops and loops['submit'].is_alive() and not loops['submit'].stop.is_set() else 'off'} · "
+                 f"exploit loop: {'on' if 'exploit' in loops and loops['exploit'].is_alive() and not loops['exploit'].stop.is_set() else 'off'} · "
                  f"tools up: {running_tools}")
 
     def pump():
@@ -1391,16 +1589,18 @@ def run_gui():
     def place_sash():
         try:
             h = paned.winfo_height()
-            frac = float(cfg.get("sash") or 0.68)
-            hi = max(430, h - 150)
+            frac = float(cfg.get("sash") or 0.82)
+            hi = max(430, h - 100)
             paned.sashpos(0, max(380, min(int(h * frac), hi)))
         except (tk.TclError, ValueError):
             pass
 
     if os.environ.get("FLAGR_GUI_TAB"):
         try:
-            nb.select(int(os.environ["FLAGR_GUI_TAB"]))
-        except (ValueError, tk.TclError):
+            initial_tab = int(os.environ["FLAGR_GUI_TAB"])
+            if 0 <= initial_tab < nb.index("end"):
+                root.after(100, lambda: nb.select(initial_tab))
+        except ValueError:
             pass
 
     root.protocol("WM_DELETE_WINDOW", on_close)
