@@ -3,6 +3,9 @@
 import base64
 import json
 import os
+import shlex
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -191,7 +194,11 @@ class FlagrTest(unittest.TestCase):
     def test_tools_catch_and_stop(self):
         got = []
         cfg = dict(self.cfg)
-        cfg["tools"] = {"demo": {"dir": "", "start": "printf 'GEMASTIK{toolflag}\\n'; sleep 30",
+        script = flagr.HOME / "emit_tool_flag.py"
+        script.write_text("import time\nprint('GEMASTIK{toolflag}', flush=True)\ntime.sleep(30)\n")
+        argv = [sys.executable, "-u", str(script)]
+        command = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+        cfg["tools"] = {"demo": {"dir": "", "start": command,
                                  "stop": "", "extra": "", "url": "", "catch": True}}
         tm = flagr.Tools(cfg, lambda m: None, submit=got.extend)
         self.assertTrue(tm.start("demo"))

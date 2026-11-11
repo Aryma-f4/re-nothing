@@ -690,6 +690,15 @@ class Tools:
         p = self.procs.get(name)
         if not p or p.poll() is not None:
             return
+        if os.name == "nt":
+            # Commands run through cmd.exe; terminate its child processes too.
+            try:
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               check=True)
+                return
+            except (OSError, subprocess.CalledProcessError):
+                pass
         try:
             os.killpg(os.getpgid(p.pid), signal.SIGTERM)
         except Exception:
