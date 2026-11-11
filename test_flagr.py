@@ -92,9 +92,12 @@ class FlagrTest(unittest.TestCase):
     def test_submit_dedupe_archive(self):
         (flagr.INBOX / "a.txt").write_text("GEMASTIK{one}\nGEMASTIK{two}\nGEMASTIK{bad}\n")
         auth = flagr.Auth(self.cfg, lambda m: None)
-        stats = flagr.process(self.cfg, auth, lambda m: None)
+        logs = []
+        stats = flagr.process(self.cfg, auth, logs.append)
         self.assertEqual(stats["accepted"], 2)
         self.assertEqual(stats["invalid"], 1)
+        self.assertTrue(any(m.startswith("  accepted: ") for m in logs))
+        self.assertTrue(any("submit done:" in m and "accepted=2" in m for m in logs))
         self.assertEqual(list(flagr.INBOX.glob("*.txt")), [])
         self.assertEqual(len(list(flagr.ARCH.glob("*"))), 1)
 
@@ -117,10 +120,13 @@ class FlagrTest(unittest.TestCase):
         }
         self.cfg["concurrency"] = 4
         self.cfg["exploit_timeout"] = 5
-        stats = flagr.run_all(self.cfg, flagr.Auth(self.cfg, lambda m: None), lambda m: None)
+        logs = []
+        stats = flagr.run_all(self.cfg, flagr.Auth(self.cfg, lambda m: None), logs.append)
         self.assertEqual(stats["targets"], 2, "own team must be skipped")
         self.assertEqual(stats["flags"], 2)
         self.assertEqual(stats["submitted"], 2)
+        self.assertTrue(any("flags=1" in m for m in logs))
+        self.assertTrue(any("submit done:" in m for m in logs))
 
     def test_parsers(self):
         self.assertEqual(flagr.parse_teams("A 10.0.0.2\n! Me 10.0.0.1\n# c\n").__len__(), 2)
@@ -160,6 +166,8 @@ class FlagrTest(unittest.TestCase):
         self.assertIn("ataka", cfg)
         self.assertEqual(cfg["tulip"]["start"], "custom")
         self.assertEqual(cfg["tulip"]["url"], "http://localhost:3000")
+        for name in ("ataka", "yampa", "tulip"):
+            self.assertGreater(len(flagr.TOOL_GUIDES[name]), 200, name)
 
     def test_tools_catch_and_stop(self):
         got = []

@@ -71,6 +71,88 @@ TOOL_DEFAULTS = {
     },
 }
 
+TOOL_GUIDES = {
+    "ataka": """Ataka - centralized exploit runner (OpenAttackDefenseTools)
+
+SETUP (once)
+1. Download the player-cli from the ataka API container (port 8000), per its README.
+2. Save it and make it executable:
+     macOS/Linux:  ~/.local/bin/atk        chmod +x ~/.local/bin/atk
+     Windows:      C:\\Users\\<you>\\.local\\bin\\atk   (run with `python atk` if needed)
+3. After the server's ctfconfig changes:  atk reload
+4. Sanity check:  atk exploit ls
+
+IN FLAGR (Tools tab)
+  dir    empty (CLI is global), or your exploit folder if you use `atk exploit new`
+  start  atk exploit runlocal --all-targets     (runs until Stop)
+  stop   empty -> flagr just terminates the process
+  extra  atk exploit ls  |  atk flag ids  |  atk exploit logs -n 3
+  Open UI  none (CLI only)
+  catch flags  ON -> flags printed by ataka are submitted to GEMASTIK
+
+NOTES
+- Local mode (`runlocal`) attacks the NOP team by default; --all-targets hits real targets.
+- Centralized mode runs exploits on the ataka server, which already submits to the game
+  server itself; with `catch` ON you may just see duplicates (harmless).
+- Ataka exploits receive TARGET_IP and TARGET_EXTRA (JSON). That is separate from the
+  {ip} {port} placeholders used by flagr's own Mass exploit runner.
+- `atk exploit upload` deploys a job; `atk exploit logs <id>` follows its output.
+""",
+    "yampa": """Yampa - MITM proxy between the game network and your vulnbox
+
+SETUP (once)
+1. git clone https://github.com/OpenAttackDefenseTools/yampa
+2. cd yampa && ./generate-env.sh
+3. Edit .env: proxied ports/services, plugin and rules directories.
+4. Docker Desktop must be running (docker compose v2).
+
+IN FLAGR (Tools tab)
+  dir    the yampa repo folder (use Browse)
+  start  docker compose up -d
+  stop   docker compose down
+  extra  ./lint-rules.sh && ./reload.sh      (reload plugins without restart)
+  Open UI  none (yampa is a proxy)
+  catch flags  OFF (it is not a flag source)
+
+NOTES
+- `docker compose up -d` exits right away, so the status shows "exited rc=0" even though
+  the containers keep running. To verify: set extra to `docker compose ps` and Run extra,
+  or run `docker compose logs -f` for live output.
+- Plugins live in ./plugins, rules in ./rules; reload with the extra command.
+- filter_plugin.py is always active; with empty rules it forwards traffic unchanged.
+- Wrappers (e.g. TLS) survive plugin reloads, by design.
+""",
+    "tulip": """Tulip - flow analyzer for traffic from your services
+
+SETUP (once)
+1. git clone https://github.com/OpenAttackDefenseTools/tulip
+2. cd tulip && cp .env.example .env
+3. Edit .env: TRAFFIC_DIR_HOST, TICK_START, TICK_LENGTH, FLAG_REGEX
+   (e.g. GEMASTIK\\{[^}]+\\})
+4. Edit services/api/configurations.py: vm_ip and the services list (name + port).
+5. Docker Desktop must be running.
+
+IN FLAGR (Tools tab)
+  dir    the tulip repo folder (use Browse)
+  start  docker compose up -d --build
+  stop   docker compose down
+  extra  docker compose logs --tail=50 assembler
+  Open UI  http://localhost:3000
+  catch flags  OFF (analyze traffic; it is not a submitter)
+
+GET TRAFFIC IN
+- On the vulnbox, rotate captures:
+    tcpdump -i eth0 -G 180 -w "traffic_%H:%M:%S.pcap" port <service port>
+- Copy them to the machine running tulip, into TRAFFIC_DIR_HOST:
+    rsync -avz -e ssh --progress root@<vulnbox>:/pcaps ./pcaps
+- The assembler uses inotify and ingests new pcaps automatically.
+
+TIP
+- If services/api/configurations.py changes later, rebuild just the api:
+    docker compose up --build -d api
+""",
+}
+
 DEFAULT_CFG = {
     "base": "https://gemastik19-finals.siberlab.id",
     "username": "",
@@ -192,6 +274,11 @@ class Api:
     def submit(self, token, flags):
         payload = flags[0] if len(flags) == 1 else list(flags)
         return self._post("/api/flag", {"flag": payload}, token=token)
+
+
+def _short(text, limit=30):
+    text = str(text)
+    return text if len(text) <= limit else text[:limit - 3] + "..."
 
 
 def normalize_token(raw):
@@ -364,6 +451,10 @@ def process(cfg, auth, log=print, extra=None):
                 _archive(f)
             return stats
 
+        batches = (len(todo) + 199) // 200
+        log(f"submit: {len(todo)} new flag(s) in {batches} batch(es)")
+        detail = 0
+
         for i in range(0, len(todo), 200):
             batch = todo[i:i + 200]
             resp = None
@@ -387,6 +478,9 @@ def process(cfg, auth, log=print, extra=None):
                     seen.add(row["flag"])
                     stats[res] += 1
                     counts[res] = counts.get(res, 0) + 1
+                    if detail < 40:
+                        log(f"  {res}: {_short(row['flag'], 60)}")
+                        detail += 1
                 else:
                     stats["unknown"] += 1
                     counts["unknown"] = counts.get("unknown", 0) + 1
@@ -398,6 +492,14 @@ def process(cfg, auth, log=print, extra=None):
                 _archive(f)
         else:
             log(f"submit error: {stats['error']} (flags kept for retry)")
+        total = len(todo)
+        if total > 40:
+            log(f"  ... {total - 40} more result line(s) not shown")
+        summary = (f"submit done: accepted={stats['accepted']} duplicate={stats['duplicate']} "
+                   f"invalid={stats['invalid']} own={stats['own']} unknown={stats['unknown']}")
+        if stats["error"]:
+            summary += f" error={_short(stats['error'], 120)}"
+        log(summary)
         return stats
 
 
@@ -593,7 +695,8 @@ def _run_one(team, ip, service, port, cmd, timeout):
                            capture_output=True, text=True, timeout=timeout, env=env)
         out = (p.stdout or "") + "\n" + (p.stderr or "")
         return {"team": team, "service": service, "port": port,
-                "flags": extract_flags(out), "rc": p.returncode, "error": None}
+                "flags": extract_flags(out), "rc": p.returncode, "error": None,
+                "tail": out[-800:]}
     except subprocess.TimeoutExpired:
         return {"team": team, "service": service, "port": port,
                 "flags": [], "rc": -1, "error": "timeout"}
@@ -628,10 +731,17 @@ def run_all(cfg, auth, log=print):
         futs = [ex.submit(_run_one, *task, timeout) for task in tasks]
         for fut in as_completed(futs):
             r = fut.result()
+            where = f"{r['team']} {r['service']}:{r['port']}"
             if r["error"]:
-                log(f"  {r['team']} {r['service']}:{r['port']} error: {r['error']}")
+                log(f"  {where} error: {r['error']}")
+            elif r["flags"]:
+                shown = ", ".join(_short(f, 34) for f in r["flags"][:3])
+                more = "" if len(r["flags"]) <= 3 else f" (+{len(r['flags']) - 3} more)"
+                log(f"  {where} rc={r['rc']} flags={len(r['flags'])}: {shown}{more}")
             else:
-                log(f"  {r['team']} {r['service']}:{r['port']} rc={r['rc']} flags={len(r['flags'])}")
+                log(f"  {where} rc={r['rc']} flags=0")
+                for line in (r.get("tail") or "").strip().splitlines()[-3:]:
+                    log(f"    {_short(line, 200)}")
             found += r["flags"]
 
     stats["flags"] = len(found)
@@ -1059,7 +1169,7 @@ def run_gui():
         text="Start/stop external stacks. Ataka: `atk` player-cli on PATH. "
              "Yampa/Tulip: docker compose + repo dir. "
              "`catch flags` auto-submits flags printed by the tool.",
-        foreground="#555", wraplength=900, justify="left",
+        foreground="#555", wraplength=840, justify="left",
     ).grid(row=0, column=0, sticky="w", pady=(0, 4))
 
     tool_status = {}
@@ -1073,6 +1183,22 @@ def run_gui():
         t["catch"] = bool(cv.get())
         save_cfg(cfg)
         return t
+
+    def open_guide(name):
+        win = tk.Toplevel(root)
+        win.title(f"{name.capitalize()} - guide")
+        win.geometry("760x560")
+        win.transient(root)
+        frame = ttk.Frame(win, padding=10)
+        frame.pack(fill="both", expand=True)
+        bar = ttk.Frame(frame)
+        bar.pack(side="bottom", fill="x", pady=(8, 0))
+        ttk.Button(bar, text="Close", command=win.destroy).pack(side="right")
+        txt = scrolledtext.ScrolledText(frame, wrap="word", font=mono)
+        txt.pack(fill="both", expand=True)
+        txt.insert("1.0", TOOL_GUIDES.get(name, "No guide for this tool."))
+        txt.configure(state="disabled")
+        txt.focus_set()
 
     for i, name in enumerate(cfg.get("tools", {}).keys()):
         t = cfg["tools"][name]
@@ -1107,6 +1233,7 @@ def run_gui():
                 tool_save(n)
 
         mk(btns, "Browse", choose_dir)
+        mk(btns, "Guide", lambda n=name: open_guide(n))
         mk(btns, "Start", lambda n=name: (tool_save(n), tools_mgr.start(n)))
         mk(btns, "Stop", lambda n=name: (tool_save(n), tools_mgr.stop(n)))
         mk(btns, "Run extra", lambda n=name: (tool_save(n), tools_mgr.run_once(n)))
