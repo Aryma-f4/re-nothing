@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Self-check for flagr: login, batch submit, dedupe, archive, retry. Stdlib only."""
+"""Self-check for flagr: login, targets, batch submit, dedupe, archive, retry."""
 import base64
 import json
 import os
@@ -62,6 +62,16 @@ class Mock(BaseHTTPRequestHandler):
             return self._send(200, {"results": res})
         self._send(404, {})
 
+    def do_GET(self):
+        if self.path == "/api/user":
+            if self.headers.get("Authorization") != f"Bearer {fake_jwt()}":
+                return self._send(401, {"msg": "unauthorized"})
+            return self._send(200, [
+                {"id": 1, "username": "Opponent", "vpn_ip": "10.13.37.1"},
+                {"id": 7, "username": "u", "vpn_ip": "10.13.37.7"},
+            ])
+        self._send(404, {})
+
 
 class FlagrTest(unittest.TestCase):
     @classmethod
@@ -115,7 +125,8 @@ class FlagrTest(unittest.TestCase):
 
     def test_mass_exploit_runner(self):
         self.cfg["teams"] = [{"name": "Alpha", "ip": "10.0.0.2", "self": False},
-                             {"name": "Own", "ip": "10.0.0.1", "self": True}]
+                             {"name": "Own", "ip": "10.0.0.1", "self": False}]
+        self.cfg["own_ip"] = "10.0.0.1"
         self.cfg["services"] = [{"name": "web", "port": 30000},
                                 {"name": "pwn", "port": 30001}]
         self.cfg["exploits"] = {
@@ -131,6 +142,19 @@ class FlagrTest(unittest.TestCase):
         self.assertEqual(stats["submitted"], 2)
         self.assertTrue(any("flags=1" in m for m in logs))
         self.assertTrue(any("submit done:" in m for m in logs))
+
+    def test_sync_teams_and_batch_single_flag(self):
+        auth = flagr.Auth(self.cfg, lambda m: None)
+        teams = flagr.fetch_teams(self.cfg, auth)
+        self.assertEqual(len(teams), 2)
+        self.assertTrue(teams[1]["self"])
+        self.assertFalse(teams[0]["self"])
+        self.assertEqual(flagr._normalize({"results": [{"flag": "GEMASTIK{x}",
+                         "status": "accepted"}]}, ["GEMASTIK{x}"])[0]["result"], "accepted")
+        (flagr.INBOX / "one.txt").write_text("GEMASTIK{single}\n")
+        result = flagr.process(self.cfg, auth, lambda m: None)
+        self.assertEqual(result["accepted"], 1)
+        self.assertEqual(Mock.calls[-1][1]["flag"], ["GEMASTIK{single}"])
 
     def test_parsers(self):
         self.assertEqual(flagr.parse_teams("A 10.0.0.2\n! Me 10.0.0.1\n# c\n").__len__(), 2)

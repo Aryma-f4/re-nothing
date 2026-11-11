@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""flagr - minimal attack/defense flag submitter (Python 3 stdlib only).
+"""flagr - attack/defense flag submitter (Python 3 + requests).
 
 Modes:
   flagr                          GUI (Submit / Mass exploit / Tools tabs)
@@ -19,6 +19,7 @@ Env: FLAGR_HOME overrides ~/.flagr
 import argparse
 import base64
 import getpass
+import ipaddress
 import json
 import os
 import queue
@@ -30,10 +31,9 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import urllib.error
 import urllib.parse
-import urllib.request
 from pathlib import Path
+import requests
 
 # GUI apps launched from Finder/Explorer get a minimal PATH; restore the
 # usual tool locations so docker/atk resolve from the Tools tab.
@@ -163,6 +163,7 @@ DEFAULT_CFG = {
     "token_exp": 0,
     "interval": 60,
     "teams": [],
+    "own_ip": "",
     "services": [],
     "exploits": {},
     "concurrency": 8,
@@ -284,31 +285,34 @@ class Api:
     def __init__(self, base):
         self.base = base.rstrip("/")
 
-    def _post(self, path, payload, token=None):
-        req = urllib.request.Request(
-            self.base + path, data=json.dumps(payload).encode(), method="POST"
-        )
-        req.add_header("Content-Type", "application/json")
+    def _request(self, method, path, payload=None, token=None):
+        headers = {}
         if token:
-            req.add_header("Authorization", f"Bearer {token}")
+            headers["Authorization"] = f"Bearer {token}"
         try:
-            with urllib.request.urlopen(req, timeout=20) as r:
-                raw = r.read().decode("utf-8", "replace")
-        except urllib.error.HTTPError as e:
-            raise ApiError(e.code, e.read().decode("utf-8", "replace")) from None
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            resp = requests.request(method, self.base + path, json=payload,
+                                    headers=headers, timeout=20)
+        except requests.RequestException as e:
             raise ApiError(0, str(e)) from None
+        raw = resp.text
+        if resp.status_code >= 400:
+            raise ApiError(resp.status_code, raw) from None
         try:
             return json.loads(raw) if raw.strip() else {}
         except ValueError:
             raise ApiError(0, "non-JSON response: " + raw[:300]) from None
 
+    def _post(self, path, payload, token=None):
+        return self._request("POST", path, payload, token)
+
     def login(self, username, password):
         return self._post("/api/login", {"username": username, "password": password})
 
     def submit(self, token, flags):
-        payload = flags[0] if len(flags) == 1 else list(flags)
-        return self._post("/api/flag", {"flag": payload}, token=token)
+        return self._post("/api/flag", {"flag": list(flags)}, token=token)
+
+    def users(self, token):
+        return self._request("GET", "/api/user", token=token)
 
 
 def _short(text, limit=30):
@@ -552,12 +556,18 @@ class Loop(threading.Thread):
 
     def run(self):
         self.log(f"{self.name} started (every {int(self.cfg.get(self.interval_key, 60))}s)")
+        next_run = time.monotonic()
         while not self.stop.is_set():
+            if self.stop.wait(max(0, next_run - time.monotonic())):
+                break
             try:
                 self.fn()
             except Exception as e:  # keep the loop alive
                 self.log(f"{self.name} tick failed: {e}")
-            self.stop.wait(max(5, int(self.cfg.get(self.interval_key, 60))))
+            interval = max(5, int(self.cfg.get(self.interval_key, 60)))
+            next_run += interval
+            while next_run <= time.monotonic():
+                next_run += interval
         self.log(f"{self.name} stopped")
 
 
@@ -750,8 +760,11 @@ def _run_one(team, ip, service, port, cmd, timeout):
 
 
 def run_all(cfg, auth, log=print):
-    """Run every (team, service) exploit in parallel, then submit found flags."""
-    teams = [t for t in cfg.get("teams", []) if not t.get("self")]
+    """Run every (team, service) exploit in parallel, submitting results promptly."""
+    own_name = jwt_payload(cfg.get("token") or "").get("sub") or cfg.get("username") or ""
+    own_ip = cfg.get("own_ip") or ""
+    teams = [t for t in cfg.get("teams", []) if not t.get("self")
+             and t.get("name") != own_name and t.get("ip") != own_ip]
     services = cfg.get("services", [])
     exploits = cfg.get("exploits", {})
     tasks = []
@@ -770,7 +783,22 @@ def run_all(cfg, auth, log=print):
     timeout = max(1, int(cfg.get("exploit_timeout", 20)))
     log(f"exploit: {len(tasks)} tasks, concurrency {conc}, timeout {timeout}s")
 
-    found = []
+    pending = []
+    last_submit = 0.0
+
+    def submit_pending():
+        nonlocal last_submit
+        if not pending:
+            return
+        sub = process(cfg, auth, log, extra=pending)
+        stats["submitted"] += sub.get("accepted", 0) + sub.get("duplicate", 0)
+        stats["error"] = sub.get("error") or stats["error"]
+        if sub.get("error"):
+            make_queued_flags(pending)
+            log(f"exploit: {len(pending)} flag(s) queued for retry")
+        pending.clear()
+        last_submit = time.monotonic()
+
     with ThreadPoolExecutor(max_workers=conc) as ex:
         futs = [ex.submit(_run_one, *task, timeout) for task in tasks]
         for fut in as_completed(futs):
@@ -786,14 +814,13 @@ def run_all(cfg, auth, log=print):
                 log(f"  {where} rc={r['rc']} flags=0")
                 for line in (r.get("tail") or "").strip().splitlines()[-3:]:
                     log(f"    {_short(line, 200)}")
-            found += r["flags"]
+            stats["flags"] += len(r["flags"])
+            pending.extend(r["flags"])
+            if pending and (len(pending) >= 20 or time.monotonic() - last_submit >= 1):
+                submit_pending()
 
-    stats["flags"] = len(found)
-    if found:
-        sub = process(cfg, auth, log, extra=found)
-        stats["submitted"] = sub.get("accepted", 0) + sub.get("duplicate", 0)
-        stats["error"] = sub.get("error")
-    else:
+    submit_pending()
+    if not stats["flags"]:
         log("exploit: no flags found this run")
     return stats
 
@@ -812,6 +839,43 @@ def parse_teams(text):
             continue
         out.append({"name": " ".join(parts[:-1]), "ip": parts[-1], "self": own})
     return out
+
+
+def fetch_teams(cfg, auth):
+    """Read live targets from the scoring API and identify our own box."""
+    api = Api(cfg["base"])
+    for attempt in (0, 1):
+        try:
+            token = auth.token(force=bool(attempt))
+            rows = api.users(token)
+            break
+        except ApiError as e:
+            if e.status in (401, 403) and not attempt:
+                auth.invalidate()
+                continue
+            raise
+    if not isinstance(rows, list):
+        raise ValueError("/api/user did not return a team list")
+    own_name = jwt_payload(token).get("sub") or cfg.get("username") or ""
+    own_ip = cfg.get("own_ip") or ""
+    teams = []
+    seen_ips = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name, ip = str(row.get("username") or "").strip(), str(row.get("vpn_ip") or "").strip()
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if not name or ip in seen_ips:
+            continue
+        seen_ips.add(ip)
+        teams.append({"name": name, "ip": ip,
+                      "self": bool((own_name and name == own_name) or (own_ip and ip == own_ip))})
+    if not any(t["self"] for t in teams):
+        raise ValueError("own team not found; set username or Own VPN IP before syncing")
+    return teams
 
 
 def dump_teams(teams):
@@ -1189,6 +1253,13 @@ def run_gui():
     teams_text.grid(row=1, column=0, sticky="nsew", pady=2)
     style_text(teams_text)
     teams_text.insert("1.0", dump_teams(cfg.get("teams", [])))
+    own_ip_var = tk.StringVar(value=cfg.get("own_ip") or "")
+    team_actions = ttk.Frame(target_card, style="Card.TFrame")
+    team_actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+    ttk.Label(team_actions, text="Own VPN IP", style="Card.TLabel").pack(side="left")
+    ttk.Entry(team_actions, textvariable=own_ip_var, width=15).pack(side="left", padx=(6, 10))
+    sync_btn = ttk.Button(team_actions, text="Sync teams from API")
+    sync_btn.pack(side="left")
     services_text = scrolledtext.ScrolledText(target_card, height=5, wrap="none", font=mono, width=30)
     services_text.grid(row=1, column=1, sticky="nsew", padx=(10, 0), pady=2)
     style_text(services_text)
@@ -1240,7 +1311,9 @@ def run_gui():
     act.grid(row=2, column=0, sticky="w", pady=(10, 0))
 
     def save_exploit():
+        save_fields()
         cfg["teams"] = parse_teams(teams_text.get("1.0", "end"))
+        cfg["own_ip"] = own_ip_var.get().strip()
         cfg["services"] = parse_services(services_text.get("1.0", "end"))
         cfg["exploits"] = parse_exploits(exploit_text.get("1.0", "end"))
         for key, var, default in (("concurrency", conc_var, 8),
@@ -1256,6 +1329,34 @@ def run_gui():
         refresh_mass_counts()
         return cfg
 
+    def sync_teams():
+        save_fields()
+        cfg["own_ip"] = own_ip_var.get().strip()
+        sync_btn.config(state="disabled")
+
+        def work():
+            try:
+                teams = fetch_teams(cfg, auth)
+            except Exception as e:
+                log(f"team sync failed: {e}")
+                root.after(0, lambda: sync_btn.config(state="normal"))
+                return
+
+            def apply():
+                cfg["teams"] = teams
+                save_cfg(cfg)
+                teams_text.delete("1.0", "end")
+                teams_text.insert("1.0", dump_teams(teams))
+                refresh_mass_counts()
+                sync_btn.config(state="normal")
+                log(f"team sync: {len(teams) - 1} opponents + own team")
+
+            root.after(0, apply)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    sync_btn.config(command=sync_teams)
+
     def run_now():
         save_exploit()
         threading.Thread(target=lambda: run_all(cfg, auth, log), daemon=True).start()
@@ -1266,6 +1367,11 @@ def run_gui():
     exploit_btn.pack(side="left")
     exploit_btn.config(command=lambda: toggle_loop("exploit", exploit_btn,
                                                    "Start auto exploit", "Stop auto exploit"))
+    ttk.Label(runner_card,
+              text="Connect WireGuard first. Use each service port from Challenges; "
+                   "180 s repeats every round and submits flags as they arrive.",
+              style="CardMuted.TLabel", wraplength=800).grid(
+                  row=3, column=0, sticky="w", pady=(8, 0))
 
     # ---------- tab: tools (ataka / yampa / tulip) ----------
     tab3 = ttk.Frame(nb, padding=12)

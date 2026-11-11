@@ -31,7 +31,7 @@ echo "using $("$PY" -c 'import sys;print(sys.executable, sys.version.split()[0])
 
 VENV=".venv-build"
 [ -d "$VENV" ] || "$PY" -m venv "$VENV"
-"$VENV/bin/python" -m pip install --quiet --upgrade pip pyinstaller
+"$VENV/bin/python" -m pip install --quiet --upgrade pip pyinstaller -r requirements.txt
 
 FLAGS=(--noconfirm --clean --name flagr)
 if [ "$(uname -s)" = "Darwin" ]; then

@@ -15,7 +15,7 @@ if errorlevel 1 (
 if not exist .venv-build (
   %PY% -m venv .venv-build || exit /b 1
 )
-.venv-build\Scripts\python -m pip install --quiet --upgrade pip pyinstaller || exit /b 1
+.venv-build\Scripts\python -m pip install --quiet --upgrade pip pyinstaller -r requirements.txt || exit /b 1
 .venv-build\Scripts\python -m PyInstaller --noconfirm --clean --onefile --windowed --name flagr flagr.py || exit /b 1
 
 echo.
